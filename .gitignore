@@ -1,0 +1,22 @@
+# --- 隱私與安全 (最重要) ---
+.env
+
+
+# --- Python 自動產生的暫存檔 ---
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.Python
+env/
+
+# --- 大數據與日誌 (避免塞爆 GitHub) ---
+*.csv
+*.xlsx
+*.log
+logs/
+data/
+
+
+# --- VS Code 設定 ---
+.vscode/
