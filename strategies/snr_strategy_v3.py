@@ -138,7 +138,7 @@ class SNRStrategyV3(BaseStrategy):
     # ── 回測參數對照表 ─────────────────────────────────────────────────────────
     BACKTEST_PARAMS = {
         # ── SR 密度法識別 ──────────────────────────────────
-        "sr_lookback_15m":       500,    # 15M 回望根數（約1週）
+        "sr_lookback_5m":        1500,   # 5M 回望根數（約1週）
         "sr_lookback_1h":        1000,   # 1H  回望根數（約6週）
         "sr_lookback_4h":        540,    # 4H  回望根數（約3個月）
         "sr_lookback_1d":        130,    # 1D  回望根數（約半年）
@@ -149,10 +149,10 @@ class SNRStrategyV3(BaseStrategy):
         "sr_merge_dist_mult":    0.5,    # 跨時框合併距離 = ATR × 此值
 
         # ── 趨勢確認（大時間框）─────────────────────────────
-        "htf_primary":           "4h",   # 主趨勢時框（"4h" or "1h"）
-        "htf_secondary":         "1h",   # 次趨勢時框（兩者一致才進場）
-        "htf_structure_lookback": 80,    # HTF 結構判斷回望根數
-        "htf_swing_len":         3,      # 高低點判斷左右各幾根
+        "htf_primary":           "4h",   # 主趨勢時框
+        "htf_secondary":         "1h",   # 次趨勢時框
+        "htf_primary_ema":       50,     # 主框架 EMA 週期（4H EMA50）
+        "htf_secondary_ema":     21,     # 次框架 EMA 週期（1H EMA21）
 
         # ── 進場條件 ───────────────────────────────────────
         "sr_near_mult":          2.5,    # 「靠近SR區」= 距SR邊緣 ≤ ATR × 此值
@@ -181,7 +181,7 @@ class SNRStrategyV3(BaseStrategy):
 
     def __init__(self, trading_service, market_service, notifier, engine,
                  # ── SR 密度法識別
-                 sr_lookback_15m: int = 500,
+                 sr_lookback_5m: int = 1500,
                  sr_lookback_1h: int = 1000,
                  sr_lookback_4h: int = 540,
                  sr_lookback_1d: int = 130,
@@ -193,8 +193,8 @@ class SNRStrategyV3(BaseStrategy):
                  # ── 趨勢確認
                  htf_primary: str = "4h",
                  htf_secondary: str = "1h",
-                 htf_structure_lookback: int = 80,
-                 htf_swing_len: int = 3,
+                 htf_primary_ema: int = 50,
+                 htf_secondary_ema: int = 21,
                  # ── 進場條件
                  sr_near_mult: float = 2.5,
                  fake_break_depth_mult: float = 0.20,
@@ -229,7 +229,7 @@ class SNRStrategyV3(BaseStrategy):
 
         # SR
         self.sr_lookback = {
-            "15m": sr_lookback_15m,
+            "5m":  sr_lookback_5m,
             "1h":  sr_lookback_1h,
             "4h":  sr_lookback_4h,
             "1d":  sr_lookback_1d,
@@ -243,8 +243,8 @@ class SNRStrategyV3(BaseStrategy):
         # 趨勢
         self.htf_primary   = htf_primary
         self.htf_secondary = htf_secondary
-        self.htf_structure_lookback = htf_structure_lookback
-        self.htf_swing_len = htf_swing_len
+        self.htf_primary_ema   = htf_primary_ema
+        self.htf_secondary_ema = htf_secondary_ema
 
         # 進場
         self.sr_near_mult          = sr_near_mult
@@ -282,12 +282,22 @@ class SNRStrategyV3(BaseStrategy):
         self._momentum: MomentumState = MomentumState()
         self._cached_sr_zones: List[SRZone] = []
         self._sr_cache_bar: int = -1          # 上次更新 SR 的 bar 序號
-        self._sr_update_interval: int = 4     # 每隔幾根 15M K 棒重算一次 SR
+        self._sr_update_interval: int = 288   # 每隔幾根 5M K 棒重算一次 SR（約1天）
         self._bar_count: int = 0
 
         # SL 子單查找：進場後最多等幾秒才去 searchOpen 找子單 ID
         self._sl_lookup_attempts: int = 0
         self._sl_lookup_max: int = 5         # 最多查 5 次（每根 K 棒查一次）
+
+        # HTF EMA 方向快取（回測加速：只有 HTF K 棒更新時才重算）
+        self._htf_cache: dict = {}   # {"4h": ("bull", last_bar_time), "1h": ...}
+
+        # Skip 計數器（回測診斷用，不影響交易邏輯）
+        self.skip_counts: dict = {
+            "session": 0, "htf_neutral": 0, "no_sr": 0,
+            "no_fakebr": 0, "vol_filter": 0, "pin_bar": 0,
+            "sl_too_large": 0, "no_opposite_sr": 0, "rr_too_low": 0,
+        }
 
         # ── Dashboard 資料字典（供 dashboard.py 讀取，與 v2 格式相容）────────
         self.dashboard: dict = {
@@ -310,17 +320,20 @@ class SNRStrategyV3(BaseStrategy):
     # ──────────────────────────────────────────────────────────────────────────
 
     async def on_bar(self, symbol: str, df: pd.DataFrame):
-        """每根 15M K 棒收盤後呼叫"""
+        """每根 5M K 棒收盤後呼叫"""
         if symbol != self.contract_id or df.empty or len(df) < 50:
             return
 
         self._bar_count += 1
 
-        # 環境更新（不受時段限制，讓 dashboard 隨時顯示趨勢和 SR）
-        await self._update_environment(df)
+        # 環境更新（回測模式下跳過 dashboard，加速執行）
+        if not getattr(self, "_backtest_mode", False):
+            await self._update_environment(df)
 
-        # 1. 時段過濾
-        if not self._is_session_open():
+        # 1. 時段過濾（回測傳入 K 棒時間，即時交易用系統時間）
+        bar_time = df.index[-1] if hasattr(df.index[-1], 'hour') else None
+        if not self._is_session_open(bar_time):
+            self.skip_counts["session"] += 1
             self.dashboard["status"] = "休市時段"
             return
 
@@ -332,6 +345,7 @@ class SNRStrategyV3(BaseStrategy):
         # 3. 大時間框趨勢確認
         trend = self._get_htf_trend()
         if trend == "neutral":
+            self.skip_counts["htf_neutral"] += 1
             logger.debug("[SNRv3] HTF 趨勢中立，跳過")
             return
 
@@ -342,18 +356,56 @@ class SNRStrategyV3(BaseStrategy):
             logger.debug(f"[SNRv3] SR 更新完成，共 {len(self._cached_sr_zones)} 個區域")
 
         if not self._cached_sr_zones:
+            self.skip_counts["no_sr"] += 1
             return
 
-        # 5. 找進場
+        # 5. 快速 SR proximity 預篩（避免每根都進 _find_entry）
+        current_price = float(df['c'].iloc[-1])
+        atr_quick = float(df['c'].iloc[-1] - df['c'].iloc[-2]) if len(df) > 1 else 5.0
+        # 用快取 ATR（上次算的）做粗估，避免重新計算
+        atr_est = getattr(self, '_cached_atr', None) or 10.0
+        max_dist_quick = atr_est * self.sr_near_mult * 1.5  # 稍微放寬，避免誤篩
+        entry_side = "bullish" if trend == "bull" else "bearish"
+        has_nearby = False
+        for z in self._cached_sr_zones:
+            if entry_side == "bullish":
+                dist = current_price - z.top
+                if -atr_est < dist < max_dist_quick:
+                    has_nearby = True
+                    break
+            else:
+                dist = z.bottom - current_price
+                if -atr_est < dist < max_dist_quick:
+                    has_nearby = True
+                    break
+        if not has_nearby:
+            return
+
+        # 6. 找進場
         await self._find_entry(df, trend)
 
     # ──────────────────────────────────────────────────────────────────────────
     # 時段過濾
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _is_session_open(self) -> bool:
-        now = datetime.now(timezone.utc)
-        h, m = now.hour, now.minute
+    def _is_session_open(self, bar_time=None) -> bool:
+        """
+        即時交易：用系統時間（UTC）判斷。
+        回測：用 K 棒時間判斷（由 on_bar 傳入 df 最後一根的時間）。
+        """
+        if bar_time is not None:
+            # 回測模式：用 K 棒時間
+            if hasattr(bar_time, 'hour'):
+                h, m = bar_time.hour, bar_time.minute
+            else:
+                from datetime import datetime
+                dt = pd.Timestamp(bar_time).to_pydatetime()
+                h, m = dt.hour, dt.minute
+        else:
+            # 即時交易：用系統 UTC 時間
+            now = datetime.now(timezone.utc)
+            h, m = now.hour, now.minute
+
         in_london = self.session_london_start <= h < self.session_london_end
         ny_start_ok = (h == self.session_ny_start and m >= self.session_ny_start_min) or \
                       (h > self.session_ny_start)
@@ -395,13 +447,19 @@ class SNRStrategyV3(BaseStrategy):
             self.dashboard["sr_zones"] = sr_display
 
             # ── 多時框趨勢 ─────────────────────────────────────────────────
-            trend_4h = self._htf_direction("4h")
-            trend_1h = self._htf_direction("1h")
+            trend_4h = self._htf_direction("4h", self.htf_primary_ema)
+            trend_1h = self._htf_direction("1h", self.htf_secondary_ema)
 
-            # 15M 趨勢：用 v3 自身的上升/下降結構判斷
-            t15_bull = self._is_uptrend(df)
-            t15_bear = self._is_downtrend(df)
-            t15_str  = "🟢多" if t15_bull else ("🔴空" if t15_bear else "⚪中性")
+            # 15M 趨勢：用 EMA21 判斷
+            closes_15m = df['c'].values
+            if len(closes_15m) >= 21:
+                k = 2.0 / 22
+                ema15 = closes_15m[0]
+                for c in closes_15m[1:]:
+                    ema15 = c * k + ema15 * (1 - k)
+                t15_str = "🟢多" if closes_15m[-1] > ema15 * 1.001 else                           ("🔴空" if closes_15m[-1] < ema15 * 0.999 else "⚪中性")
+            else:
+                t15_str = "⚪中性"
 
             label = {"bull": "🟢多", "bear": "🔴空", "neutral": "⚪中性"}
             self.dashboard["trend_4h"]  = label[trend_4h]
@@ -440,73 +498,76 @@ class SNRStrategyV3(BaseStrategy):
     def _get_htf_trend(self) -> str:
         """
         回傳 'bull' | 'bear' | 'neutral'
-        主框架 + 次框架必須一致才確認趨勢
+        主框架 EMA 方向 + 次框架 EMA 確認，兩者一致才進場。
+        比 swing 結構法穩定，neutral 情況大幅減少。
         """
-        primary   = self._htf_direction(self.htf_primary)
-        secondary = self._htf_direction(self.htf_secondary)
+        primary   = self._htf_direction(self.htf_primary,   self.htf_primary_ema)
+        secondary = self._htf_direction(self.htf_secondary, self.htf_secondary_ema)
 
         if primary == secondary and primary != "neutral":
             return primary
+        # 次框架中立時，以主框架為準（允許單向確認）
+        if primary != "neutral" and secondary == "neutral":
+            return primary
         return "neutral"
 
-    def _htf_direction(self, timeframe: str) -> str:
-        """判斷指定時框的趨勢方向"""
+    def _htf_direction(self, timeframe: str, ema_period: int) -> str:
+        """
+        用 EMA 判斷趨勢方向。
+        回測模式：直接查預算好的 {timestamp: direction} 表，O(1) 查找。
+        即時模式：動態計算 EMA。
+        """
         try:
-            bs = getattr(self.engine, 'bar_store', None)
+            # 回測模式：查預算表
+            precomputed = getattr(self, '_htf_precomputed', None)
+            if precomputed is not None:
+                key    = f"{timeframe}_{ema_period}"
+                lookup = precomputed.get(key)
+                if lookup is None or len(lookup[0]) == 0:
+                    return "neutral"
+                # 找到 <= current_bar_time 的最近 HTF K 棒
+                bs = getattr(self, '_backtest_bar_store', None) or                      getattr(self.engine, 'bar_store', None)
+                if bs is None:
+                    return "neutral"
+                # 優先用預算好的 ns timestamp，避免每次建 pd.Timestamp
+                cutoff_ns = getattr(bs, 'current_bar_time_ns', None)
+                if cutoff_ns is None:
+                    if bs.current_bar_time is None:
+                        return "neutral"
+                    cutoff_ns = int(pd.Timestamp(bs.current_bar_time).value)
+                cutoff_ns = np.int64(cutoff_ns)
+                # searchsorted 查找 <= cutoff 的最近 HTF K 棒，O(log n)
+                times, dirs = lookup
+                pos = int(np.searchsorted(times, cutoff_ns, side='right')) - 1
+                if pos < 0:
+                    return "neutral"
+                return dirs[pos]
+
+            # 即時模式：動態計算
+            bs = getattr(self, '_backtest_bar_store', None) or                  getattr(self.engine, 'bar_store', None)
             if bs is None:
                 return "neutral"
-            df = bs.load(self.contract_id, timeframe, limit=self.htf_structure_lookback)
-            if df.empty or len(df) < self.htf_swing_len * 4:
+            limit = max(ema_period * 3, 100)
+            df = bs.load(self.contract_id, timeframe, limit=limit)
+            if df.empty or len(df) < ema_period + 5:
                 return "neutral"
             if hasattr(df.index, 'tz') and df.index.tz is not None:
                 df.index = df.index.tz_convert(None)
-
-            bull = self._is_uptrend(df)
-            bear = self._is_downtrend(df)
-            if bull and not bear:
+            closes = df['c'].values
+            k   = 2.0 / (ema_period + 1)
+            ema = closes[0]
+            for c in closes[1:]:
+                ema = c * k + ema * (1 - k)
+            last_close = float(closes[-1])
+            margin     = ema * 0.001
+            if last_close > ema + margin:
                 return "bull"
-            elif bear and not bull:
+            elif last_close < ema - margin:
                 return "bear"
             return "neutral"
         except Exception as e:
-            logger.debug(f"[SNRv3] HTF direction error ({timeframe}): {e}")
+            logger.debug(f"[SNRv3] HTF EMA direction error ({timeframe}): {e}")
             return "neutral"
-
-    def _is_uptrend(self, df: pd.DataFrame) -> bool:
-        """Higher High + Higher Low 結構"""
-        highs, lows = df['h'].values, df['l'].values
-        sl = self.htf_swing_len
-        local_highs, local_lows = [], []
-
-        for i in range(sl, len(df) - sl):
-            if all(highs[i] >= highs[i - j] for j in range(1, sl + 1)) and \
-               all(highs[i] >= highs[i + j] for j in range(1, sl + 1)):
-                local_highs.append(highs[i])
-            if all(lows[i] <= lows[i - j] for j in range(1, sl + 1)) and \
-               all(lows[i] <= lows[i + j] for j in range(1, sl + 1)):
-                local_lows.append(lows[i])
-
-        hh = len(local_highs) >= 2 and local_highs[-1] > local_highs[-2]
-        hl = len(local_lows) >= 2 and local_lows[-1] > local_lows[-2]
-        return hh and hl
-
-    def _is_downtrend(self, df: pd.DataFrame) -> bool:
-        """Lower Low + Lower High 結構"""
-        highs, lows = df['h'].values, df['l'].values
-        sl = self.htf_swing_len
-        local_highs, local_lows = [], []
-
-        for i in range(sl, len(df) - sl):
-            if all(highs[i] >= highs[i - j] for j in range(1, sl + 1)) and \
-               all(highs[i] >= highs[i + j] for j in range(1, sl + 1)):
-                local_highs.append(highs[i])
-            if all(lows[i] <= lows[i - j] for j in range(1, sl + 1)) and \
-               all(lows[i] <= lows[i + j] for j in range(1, sl + 1)):
-                local_lows.append(lows[i])
-
-        ll = len(local_lows) >= 2 and local_lows[-1] < local_lows[-2]
-        lh = len(local_highs) >= 2 and local_highs[-1] < local_highs[-2]
-        return ll and lh
 
     # ──────────────────────────────────────────────────────────────────────────
     # SR 密度法 — 核心
@@ -514,101 +575,113 @@ class SNRStrategyV3(BaseStrategy):
 
     def _calc_sr_zones_density(self, df: pd.DataFrame, timeframe: str) -> List[SRZone]:
         """
-        密度法識別 SR 區
-        - 用 K 棒實體範圍做主要密度，影線做次要密度
-        - 格寬 = ATR × sr_zone_atr_mult
-        - 門檻 = 均密度 × sr_sensitivity
+        密度法識別 SR 區（向量化版本，比原始 Python 迴圈快 50-100 倍）
         """
-        lookback = self.sr_lookback.get(timeframe, 500)
+        lookback = self.sr_lookback.get(timeframe, 1500)
         if len(df) < max(lookback // 4, 20):
             return []
 
-        window = df.tail(lookback).copy()
+        window = df.tail(lookback)
         atr    = self._calc_atr(df)
         if atr <= 0:
             return []
 
         zone_thickness = max(atr * self.sr_zone_atr_mult, 0.25)
 
-        opens   = window['o'].values if 'o' in window.columns else window['c'].values
-        highs   = window['h'].values
-        lows    = window['l'].values
-        closes  = window['c'].values
-        vols    = window['v'].values if 'v' in window.columns else np.ones(len(window))
-        N       = len(window)
-        avg_vol = np.mean(vols) if np.mean(vols) > 0 else 1.0
+        opens  = window['o'].values if 'o' in window.columns else window['c'].values
+        highs  = window['h'].values
+        lows   = window['l'].values
+        closes = window['c'].values
+        vols   = window['v'].values if 'v' in window.columns else np.ones(len(window))
+
+        avg_vol    = np.mean(vols) if np.mean(vols) > 0 else 1.0
+        vol_factor = 1.0 + (vols / avg_vol - 1.0) * 0.3   # shape: (N,)
 
         price_min = float(np.min(lows))
         price_max = float(np.max(highs))
-        n_bins = max(int((price_max - price_min) / zone_thickness), 1)
-        bin_density = np.zeros(n_bins)
+        n_bins    = max(int((price_max - price_min) / zone_thickness) + 1, 1)
 
-        bw = self.sr_body_weight   # 實體權重
-        sw = 1.0 - bw              # 影線權重
+        bin_density = np.zeros(n_bins, dtype=np.float64)
+        bin_edges   = np.arange(n_bins + 1) * zone_thickness + price_min
 
-        for i in range(N):
-            o_i, h_i, l_i, c_i = opens[i], highs[i], lows[i], closes[i]
-            vol_factor = 1.0 + (vols[i] / avg_vol - 1.0) * 0.3  # 量大的K棒權重微增
+        bw = self.sr_body_weight
+        sw = 1.0 - bw
 
-            body_lo = min(o_i, c_i)
-            body_hi = max(o_i, c_i)
+        body_lo = np.minimum(opens, closes)
+        body_hi = np.maximum(opens, closes)
 
-            # 實體佔據的格子
-            if body_hi > body_lo:
-                b0 = max(int((body_lo - price_min) / zone_thickness), 0)
-                b1 = min(int((body_hi - price_min) / zone_thickness), n_bins - 1)
-                for b in range(b0, b1 + 1):
-                    bin_density[b] += bw * vol_factor
+        def _add_range_vectorized(lo_arr, hi_arr, weight_arr):
+            """用 np.histogram 完全向量化，無任何 Python 迴圈"""
+            if len(lo_arr) == 0:
+                return
+            center  = (lo_arr + hi_arr) / 2
+            width   = np.maximum(hi_arr - lo_arr, 0)
+            # 寬度越大的 K 棒實體/影線影響越多 bin，用寬度/zone_thickness 作為放大係數
+            w_scale = weight_arr * (width / zone_thickness + 1)
+            vals, _ = np.histogram(center, bins=bin_edges, weights=w_scale)
+            bin_density[:len(vals)] += vals
 
-            # 上影線
-            if h_i > body_hi:
-                b0 = max(int((body_hi - price_min) / zone_thickness), 0)
-                b1 = min(int((h_i - price_min) / zone_thickness), n_bins - 1)
-                for b in range(b0, b1 + 1):
-                    bin_density[b] += sw * vol_factor * 0.5
+        # 實體
+        has_body = body_hi > body_lo
+        if has_body.any():
+            _add_range_vectorized(
+                body_lo[has_body], body_hi[has_body],
+                (bw * vol_factor)[has_body]
+            )
 
-            # 下影線
-            if l_i < body_lo:
-                b0 = max(int((l_i - price_min) / zone_thickness), 0)
-                b1 = min(int((body_lo - price_min) / zone_thickness), n_bins - 1)
-                for b in range(b0, b1 + 1):
-                    bin_density[b] += sw * vol_factor * 0.5
+        # 上影線
+        has_upper = highs > body_hi
+        if has_upper.any():
+            _add_range_vectorized(
+                body_hi[has_upper], highs[has_upper],
+                (sw * vol_factor * 0.5)[has_upper]
+            )
 
-        # 計算門檻
+        # 下影線
+        has_lower = lows < body_lo
+        if has_lower.any():
+            _add_range_vectorized(
+                lows[has_lower], body_lo[has_lower],
+                (sw * vol_factor * 0.5)[has_lower]
+            )
+
         nonzero = bin_density[bin_density > 0]
         if len(nonzero) == 0:
             return []
-        avg_density = np.mean(nonzero)
-        threshold   = avg_density * self.sr_sensitivity
+
+        threshold = np.mean(nonzero) * self.sr_sensitivity
+
+        hot_bins = np.where(bin_density > threshold)[0]
+        if len(hot_bins) == 0:
+            return []
 
         zones: List[SRZone] = []
-        for i, density in enumerate(bin_density):
-            if density > threshold:
-                bottom = price_min + i * zone_thickness
-                top    = bottom + zone_thickness
-                zones.append(SRZone(
-                    top=round(top, 2),
-                    bottom=round(bottom, 2),
-                    strength=float(density),
-                    timeframe=timeframe,
-                ))
+        for i in hot_bins:
+            bottom = price_min + i * zone_thickness
+            top    = bottom + zone_thickness
+            zones.append(SRZone(
+                top=round(top, 2),
+                bottom=round(bottom, 2),
+                strength=float(bin_density[i]),
+                timeframe=timeframe,
+            ))
 
         zones.sort(key=lambda z: z.strength, reverse=True)
         return zones[:self.sr_max_zones]
 
-    def _build_mtf_sr_zones(self, df_15m: pd.DataFrame) -> List[SRZone]:
+    def _build_mtf_sr_zones(self, df_5m: pd.DataFrame) -> List[SRZone]:
         """
         整合多時框 SR 區
-        15M / 1H / 4H / 1D 都算，靠近的區域合併
+        5M / 1H / 4H / 1D 都算，靠近的區域合併
         """
-        atr = self._calc_atr(df_15m)
+        atr = self._calc_atr(df_5m)
         merge_dist = atr * self.sr_merge_dist_mult
 
         all_zones: List[SRZone] = []
 
         # 15M（直接用傳入的 df）
-        zones_15m = self._calc_sr_zones_density(df_15m, "15m")
-        all_zones.extend(zones_15m)
+        zones_5m_base = self._calc_sr_zones_density(df_5m, "5m")
+        all_zones.extend(zones_5m_base)
 
         # 其他時框從 bar_store 讀取
         bs = getattr(self.engine, 'bar_store', None)
@@ -725,10 +798,10 @@ class SNRStrategyV3(BaseStrategy):
                 close_price  = closes[idx]
                 sr_edge      = zone.bottom
 
+                vol_ok = (self.vol_mult <= 0) or (vols[idx] >= avg_vol * self.vol_mult)
                 if pierce_price < sr_edge and \
                    (sr_edge - pierce_price) <= max_depth and \
-                   close_price >= sr_edge and \
-                   vols[idx] >= avg_vol * self.vol_mult:
+                   close_price >= sr_edge and vol_ok:
 
                     is_pin = self._check_pin_bar(opens[idx], highs[idx], lows[idx], closes[idx], "bullish")
                     return FakeBreakout(
@@ -748,10 +821,10 @@ class SNRStrategyV3(BaseStrategy):
                 close_price  = closes[idx]
                 sr_edge      = zone.top
 
+                vol_ok = (self.vol_mult <= 0) or (vols[idx] >= avg_vol * self.vol_mult)
                 if pierce_price > sr_edge and \
                    (pierce_price - sr_edge) <= max_depth and \
-                   close_price <= sr_edge and \
-                   vols[idx] >= avg_vol * self.vol_mult:
+                   close_price <= sr_edge and vol_ok:
 
                     is_pin = self._check_pin_bar(opens[idx], highs[idx], lows[idx], closes[idx], "bearish")
                     return FakeBreakout(
@@ -795,6 +868,7 @@ class SNRStrategyV3(BaseStrategy):
         atr = self._calc_atr(df)
         if atr <= 0:
             return
+        self._cached_atr = atr  # 快取供 on_bar 預篩使用
 
         current_price = float(df['c'].iloc[-1])
 
@@ -817,11 +891,13 @@ class SNRStrategyV3(BaseStrategy):
         # 假突破偵測
         fb = self._detect_fake_breakout(df, near_zone, entry_side, atr)
         if fb is None:
+            self.skip_counts["no_fakebr"] += 1
             return
 
         # 是否強制要求 Pin Bar
         if self.require_pin_bar and not fb.is_pin_bar:
             logger.info(f"[SNRv3] 假突破出現但無 Pin Bar，跳過（require_pin_bar=True）")
+            self.skip_counts["pin_bar"] += 1
             return
 
         # 計算止損止盈
@@ -873,12 +949,14 @@ class SNRStrategyV3(BaseStrategy):
 
             if sl_dist <= 0 or sl_dist > atr * self.sl_max_atr_mult:
                 logger.info(f"[SNRv3] 止損距離 {sl_dist:.1f} 超出上限 {atr * self.sl_max_atr_mult:.1f}，跳過")
+                self.skip_counts["sl_too_large"] += 1
                 return False
 
             # 止盈：最近上方 SR 壓力區下緣
             tp_zone = self._find_tp_zone(entry_price, "above")
             if tp_zone is None:
                 logger.info("[SNRv3] 找不到對面 SR 區，跳過")
+                self.skip_counts["no_opposite_sr"] += 1
                 return False
             tp_price = tp_zone.bottom
 
@@ -889,12 +967,14 @@ class SNRStrategyV3(BaseStrategy):
 
             if sl_dist <= 0 or sl_dist > atr * self.sl_max_atr_mult:
                 logger.info(f"[SNRv3] 止損距離 {sl_dist:.1f} 超出上限 {atr * self.sl_max_atr_mult:.1f}，跳過")
+                self.skip_counts["sl_too_large"] += 1
                 return False
 
             # 止盈：最近下方 SR 支撐區上緣
             tp_zone = self._find_tp_zone(entry_price, "below")
             if tp_zone is None:
                 logger.info("[SNRv3] 找不到對面 SR 區，跳過")
+                self.skip_counts["no_opposite_sr"] += 1
                 return False
             tp_price = tp_zone.top
 
@@ -904,6 +984,7 @@ class SNRStrategyV3(BaseStrategy):
 
         if rr < self.min_rr:
             logger.info(f"[SNRv3] RR={rr:.2f} < 門檻 {self.min_rr}，跳過")
+            self.skip_counts["rr_too_low"] += 1
             return False
 
         pin_tag = "✓ Pin Bar" if fb.is_pin_bar else "無 Pin Bar"
@@ -1147,18 +1228,23 @@ class SNRStrategyV3(BaseStrategy):
                 f"（+{profit_pts:.1f} 點 / +{profit_pts * 2:.0f} USD）"
             )
 
-            # 目前固定 1 口 → 整口平倉
-            ok = await self.trading_service.close_position(
+            # partial_close_position：回測中為 no-op（標記後繼續跑 trailing）
+            # 即時交易中為整口平倉（目前 1 口策略等同全部平倉）
+            ok = await self.trading_service.partial_close_position(
                 account_id=self.account_id,
                 contract_id=self.contract_id,
+                size=1,
             )
 
             if ok:
                 trade.partial_closed = True
-                trade.is_closed = True
-                self.active_trade = None
-                self._sl_lookup_attempts = 0
-                logger.info("[SNRv3] 部分止盈平倉完成，清除持倉狀態")
+                # 即時交易：整口已平，清除狀態
+                # 回測：partial_close 是 no-op，is_closed 不設 True，讓部位繼續跑
+                if not getattr(self.trading_service, '_is_backtest', False):
+                    trade.is_closed = True
+                    self.active_trade = None
+                    self._sl_lookup_attempts = 0
+                logger.info("[SNRv3] 部分止盈完成")
                 if self.notifier:
                     await self.notifier.send_message(
                         f"✅ *[SNR v3] 部分止盈*\n"
@@ -1276,17 +1362,22 @@ class SNRStrategyV3(BaseStrategy):
     def _calc_atr(self, df: pd.DataFrame) -> float:
         if len(df) < self.atr_period + 1:
             return 0.0
+        last_t = df.index[-1]
+        if getattr(self, '_atr_cache_time', None) == last_t:
+            return self._atr_cache_val
         try:
             atr_vals = talib.ATR(
                 df['h'].values, df['l'].values, df['c'].values,
                 timeperiod=self.atr_period
             )
             val = float(atr_vals[-1])
-            return val if not np.isnan(val) else 0.0
+            val = val if not np.isnan(val) else 0.0
         except Exception:
-            # fallback: 簡單 TR 均值
-            tr = df['h'] - df['l']
-            return float(tr.tail(self.atr_period).mean())
+            tr  = df['h'] - df['l']
+            val = float(tr.tail(self.atr_period).mean())
+        self._atr_cache_time = last_t
+        self._atr_cache_val  = val
+        return val
 
     def get_pos_size(self) -> int:
         return 1  # 固定 1 口

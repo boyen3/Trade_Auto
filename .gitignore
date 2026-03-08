@@ -9,14 +9,15 @@ __pycache__/
 venv/
 .Python
 env/
-
+*.parquet
 # --- 大數據與日誌 (避免塞爆 GitHub) ---
 *.csv
 *.xlsx
 *.log
 logs/
 data/
-
+data_backtest/
+tools/
 
 # --- VS Code 設定 ---
 .vscode/
