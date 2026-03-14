@@ -32,22 +32,32 @@ class MarketDataService:
         logger.info(f"📈 行情追蹤啟動: {contract_id} | 間隔:30s")
         while self._is_polling:
             try:
-                # 策略主時框：15 分 K → DataHub
-                df_15m = await self.get_bars_df(
-                    contract_id, unit=BarUnit.MINUTE, unit_number=15, limit=100
+                # 策略主時框：5M K → DataHub（每根 5M K 棒觸發 EventEngine）
+                df_5m = await self.get_bars_df(
+                    contract_id, unit=BarUnit.MINUTE, unit_number=5, limit=100
                 )
-                if not df_15m.empty:
-                    DataHub.update_bars(contract_id, df_15m)
+                if not df_5m.empty:
+                    DataHub.update_bars(contract_id, df_5m)
                     if self.bar_store:
-                        self.bar_store.append_latest(contract_id, df_15m, "15m")
-
-                # 5 分 K → 僅存檔
-                if self.bar_store:
-                    df_5m = await self.get_bars_df(
-                        contract_id, unit=BarUnit.MINUTE, unit_number=5, limit=50
-                    )
-                    if not df_5m.empty:
                         self.bar_store.append_latest(contract_id, df_5m, "5m")
+
+                # 15M / 1H / 4H → 僅存檔（供策略讀取，不觸發 EventEngine）
+                # FIX #6: 1H 至少要 150 根供 EMA50 計算，4H 至少 55 根
+                #         原本 1H=30, 4H=10 嚴重不足，HTF 趨勢永遠 neutral
+                if self.bar_store:
+                    for tf, unit, unit_num, lim in [
+                        ("15m", BarUnit.MINUTE, 15, 100),
+                        ("1h",  BarUnit.HOUR,   1,  200),
+                        ("4h",  BarUnit.HOUR,   4,  100),
+                    ]:
+                        try:
+                            df_tf = await self.get_bars_df(
+                                contract_id, unit=unit, unit_number=unit_num, limit=lim
+                            )
+                            if not df_tf.empty:
+                                self.bar_store.append_latest(contract_id, df_tf, tf)
+                        except Exception:
+                            pass
 
             except Exception as e:
                 logger.error(f"⚠️ 行情抓取異常: {e}")

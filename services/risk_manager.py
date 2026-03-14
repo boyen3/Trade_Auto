@@ -135,12 +135,15 @@ class RiskManager:
         log_risk_triggered(reason, total_pnl, limit)
         if not self._risk_notified and self.notifier:
             self._risk_notified = True
-            import asyncio
+            # FIX #5: 用 create_task 取代 ensure_future + get_event_loop
+            # get_event_loop() 在 Python 3.10+ 非主執行緒會有 DeprecationWarning
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.ensure_future(
-                        self.notifier.notify_risk_triggered(reason, total_pnl, limit)
-                    )
+                loop = asyncio.get_running_loop()
+                loop.create_task(
+                    self.notifier.notify_risk_triggered(reason, total_pnl, limit)
+                )
+            except RuntimeError:
+                # 沒有 running loop（例如在同步環境被呼叫）→ 靜默忽略
+                pass
             except Exception:
                 pass

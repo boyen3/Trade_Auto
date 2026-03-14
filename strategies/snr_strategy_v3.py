@@ -48,6 +48,7 @@ from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone
 from strategies.base_strategy import BaseStrategy
 from core.constants import OrderSide, OrderType
+from core.data_hub import DataHub   # FIX #4: 補上頂層 import（原本缺少）
 from utils.logger import logger
 
 
@@ -188,7 +189,7 @@ class SNRStrategyV3(BaseStrategy):
                  sr_zone_atr_mult: float = 0.10,
                  sr_sensitivity: float = 1.5,
                  sr_body_weight: float = 0.70,
-                 sr_max_zones: int = 12,
+                 sr_max_zones: int = 16,        # 對齊回測 build_sr 最多 16 個
                  sr_merge_dist_mult: float = 0.50,
                  # ── 趨勢確認
                  htf_primary: str = "4h",
@@ -219,10 +220,15 @@ class SNRStrategyV3(BaseStrategy):
                  # ── 其他
                  atr_period: int = 14,
                  contract_id: str = "CON.F.US.MNQ.H26",
+                 use_fixed_rr: bool = True,   # FIX #2: 支援固定 RR 止盈（與回測一致）
+                 use_momentum: bool = False,   # 對齊回測：回測無動能衰減過濾，預設關閉
                  **kwargs):
 
         super().__init__(trading_service, market_service)
         # notifier 和 engine 由 v3 自行保存（BaseStrategy 只接受前兩個參數）
+        # FIX #1: BaseStrategy 將 trading_service 存為 self.ts，
+        #         但策略全檔用 self.trading_service，補齊這個屬性
+        self.trading_service = trading_service
         self.notifier = notifier
         self.engine   = engine
         self.contract_id = contract_id
@@ -271,6 +277,8 @@ class SNRStrategyV3(BaseStrategy):
         self.session_ny_end        = session_ny_end
 
         self.atr_period = atr_period
+        self.use_fixed_rr = use_fixed_rr  # FIX #2: 固定 RR 止盈旗標
+        self.use_momentum = use_momentum  # 動能衰減過濾旗標（對齊回測預設 False）
 
         # ── 系統對接 ──────────────────────────────────────────────────────────
         self.account_id: int = 0            # 由 main.py 注入：strategy.account_id = config["account_id"]
@@ -403,7 +411,8 @@ class SNRStrategyV3(BaseStrategy):
                 h, m = dt.hour, dt.minute
         else:
             # 即時交易：用系統 UTC 時間
-            now = datetime.now(timezone.utc)
+            import datetime as _dt
+            now = _dt.datetime.now(_dt.timezone.utc)
             h, m = now.hour, now.minute
 
         in_london = self.session_london_start <= h < self.session_london_end
@@ -450,10 +459,11 @@ class SNRStrategyV3(BaseStrategy):
             trend_4h = self._htf_direction("4h", self.htf_primary_ema)
             trend_1h = self._htf_direction("1h", self.htf_secondary_ema)
 
-            # 15M 趨勢：用 EMA21 判斷
+            # 15M 趨勢：用 htf_secondary_ema（與策略一致）
             closes_15m = df['c'].values
-            if len(closes_15m) >= 21:
-                k = 2.0 / 22
+            ema_p = self.htf_secondary_ema
+            if len(closes_15m) >= ema_p:
+                k = 2.0 / (ema_p + 1)
                 ema15 = closes_15m[0]
                 for c in closes_15m[1:]:
                     ema15 = c * k + ema15 * (1 - k)
@@ -671,64 +681,66 @@ class SNRStrategyV3(BaseStrategy):
 
     def _build_mtf_sr_zones(self, df_5m: pd.DataFrame) -> List[SRZone]:
         """
-        整合多時框 SR 區
-        5M / 1H / 4H / 1D 都算，靠近的區域合併
+        SR 識別：5M + 1H + 4H + 1D 四個時框，與回測 build_sr() 對齊。
+        各時框各算各的 SR，再做跨時框合併（中心距離 ≤ ATR×0.5 視為同一區），
+        合併時強度疊加×1.5，最終保留最強的 16 個。
         """
         atr = self._calc_atr(df_5m)
-        merge_dist = atr * self.sr_merge_dist_mult
-
-        all_zones: List[SRZone] = []
-
-        # 15M（直接用傳入的 df）
-        zones_5m_base = self._calc_sr_zones_density(df_5m, "5m")
-        all_zones.extend(zones_5m_base)
-
-        # 其他時框從 bar_store 讀取
-        bs = getattr(self.engine, 'bar_store', None)
-        for tf in ["1h", "4h", "1d"]:
-            if bs is None:
-                break
-            try:
-                limit = self.sr_lookback.get(tf, 500)
-                df_tf = bs.load(self.contract_id, tf, limit=limit)
-                if df_tf.empty:
-                    continue
-                if hasattr(df_tf.index, 'tz') and df_tf.index.tz is not None:
-                    df_tf.index = df_tf.index.tz_convert(None)
-                zones_tf = self._calc_sr_zones_density(df_tf, tf)
-                all_zones.extend(zones_tf)
-            except Exception as e:
-                logger.debug(f"[SNRv3] MTF SR load error ({tf}): {e}")
-
-        if not all_zones:
+        if atr <= 0:
             return []
 
-        # 合併：mid 距離 < merge_dist 的區域合併，強度加總
-        all_zones.sort(key=lambda z: z.mid)
-        merged: List[SRZone] = []
-        current = all_zones[0]
-        extra_strength = 0.0
+        # 各時框 lookback 設定，與回測 build_sr 一致
+        tf_configs = [
+            ("5m",  1500, df_5m),
+            ("1h",  1000, None),
+            ("4h",  540,  None),
+            ("1d",  130,  None),
+        ]
 
-        for z in all_zones[1:]:
-            if abs(z.mid - current.mid) <= merge_dist:
-                # 合併：取最大範圍，強度加總，記跨時框次數
-                new_bottom = min(current.bottom, z.bottom)
-                new_top    = max(current.top, z.top)
-                # 多時框重疊增加權重
-                tf_bonus = 1.5 if z.timeframe != current.timeframe else 1.0
-                merged_strength = current.strength + z.strength * tf_bonus
-                current = SRZone(
+        # 取得各 HTF 的 DataFrame
+        bs = getattr(self, '_backtest_bar_store', None) or \
+             getattr(self.engine, 'bar_store', None)
+
+        all_raw: List[SRZone] = []
+        for tf, lookback, df_given in tf_configs:
+            if df_given is not None:
+                df_tf = df_given
+            else:
+                if bs is None:
+                    continue
+                df_tf = bs.load(self.contract_id, tf, limit=lookback)
+                if df_tf.empty:
+                    continue
+
+            zones = self._calc_sr_zones_density(df_tf, tf)
+            all_raw.extend(zones)
+
+        if not all_raw:
+            return []
+
+        # 跨時框合併：中心距離 ≤ ATR×0.5 視為同一 SR 區
+        merge_dist = atr * self.sr_merge_dist_mult
+        all_raw.sort(key=lambda z: z.mid)
+
+        merged: List[SRZone] = []
+        cur = all_raw[0]
+        for nxt in all_raw[1:]:
+            if abs(nxt.mid - cur.mid) <= merge_dist:
+                # 合併：取最寬範圍，強度疊加×1.5（與回測一致）
+                new_bottom = min(cur.bottom, nxt.bottom)
+                new_top    = max(cur.top,    nxt.top)
+                new_str    = cur.strength + nxt.strength * 1.5
+                cur = SRZone(
                     top=round(new_top, 2),
                     bottom=round(new_bottom, 2),
-                    strength=merged_strength,
-                    timeframe=f"{current.timeframe}+{z.timeframe}",
-                    touch_count=current.touch_count + 1,
+                    strength=new_str,
+                    timeframe=cur.timeframe,
                 )
             else:
-                merged.append(current)
-                current = z
+                merged.append(cur)
+                cur = nxt
+        merged.append(cur)
 
-        merged.append(current)
         merged.sort(key=lambda z: z.strength, reverse=True)
         return merged[:self.sr_max_zones]
 
@@ -883,8 +895,8 @@ class SNRStrategyV3(BaseStrategy):
         if near_zone is None:
             return
 
-        # 動能衰減確認（需要連續 momentum_bars 根以上）
-        if not self._momentum.decaying:
+        # 動能衰減確認（use_momentum=True 時才啟用，預設關閉以對齊回測）
+        if self.use_momentum and not self._momentum.decaying:
             logger.debug(f"[SNRv3] 動能未衰減，等待 SR {near_zone.mid:.1f}")
             return
 
@@ -906,31 +918,32 @@ class SNRStrategyV3(BaseStrategy):
 
     def _find_near_zone(self, price: float, side: str, atr: float) -> Optional[SRZone]:
         """
-        找符合條件的 SR 區：
-        - bullish：在 price 下方，且距離 ≤ sr_near_mult × ATR
-        - bearish：在 price 上方，且距離 ≤ sr_near_mult × ATR
+        找符合條件的 SR 區，與回測 run_single 的 proximity 判斷對齊：
+        - bullish：price 在 SR top 上方，且距離 ≤ sr_near_mult × ATR
+                   即 0 < price - SR.top < max_dist
+                   （回測: -atr < bc - zt_top < max_dist，允許微幅進入區內）
+        - bearish：price 在 SR bottom 下方，且距離 ≤ sr_near_mult × ATR
+                   即 0 < SR.bottom - price < max_dist
         """
         max_dist = atr * self.sr_near_mult
         candidates = []
 
         for z in self._cached_sr_zones:
             if side == "bullish":
-                # price 在 SR 區內或剛進入 SR 區上方
-                in_zone = z.bottom <= price <= z.top
-                near_above = price > z.top and (price - z.top) <= max_dist
-                if in_zone or near_above:
-                    candidates.append((z, abs(price - z.mid)))
-            elif side == "bearish":
-                in_zone = z.bottom <= price <= z.top
-                near_below = price < z.bottom and (z.bottom - price) <= max_dist
-                if in_zone or near_below:
-                    candidates.append((z, abs(price - z.mid)))
+                dist = price - z.top   # 正值 = price 在 SR 上方
+                # 允許微幅進入 SR 區內（最多 1 個 ATR），與回測 -atr < bc-zt_top 一致
+                if -atr < dist < max_dist:
+                    candidates.append((z, abs(dist)))
+            else:
+                dist = z.bottom - price  # 正值 = price 在 SR 下方
+                if -atr < dist < max_dist:
+                    candidates.append((z, abs(dist)))
 
         if not candidates:
             return None
 
-        # 最近且最強的（距離 × 1/強度 排序）
-        candidates.sort(key=lambda x: x[1] / (x[0].strength + 1e-9))
+        # 最近的 SR 區優先（與回測逐個掃描、找到第一個即進場一致）
+        candidates.sort(key=lambda x: x[1])
         return candidates[0][0]
 
     async def _evaluate_trade(self, df: pd.DataFrame, fb: FakeBreakout,
@@ -952,13 +965,16 @@ class SNRStrategyV3(BaseStrategy):
                 self.skip_counts["sl_too_large"] += 1
                 return False
 
-            # 止盈：最近上方 SR 壓力區下緣
-            tp_zone = self._find_tp_zone(entry_price, "above")
-            if tp_zone is None:
-                logger.info("[SNRv3] 找不到對面 SR 區，跳過")
-                self.skip_counts["no_opposite_sr"] += 1
-                return False
-            tp_price = tp_zone.bottom
+            # FIX #2: 止盈方式 — 固定 RR 或找對面 SR
+            if self.use_fixed_rr:
+                tp_price = entry_price + sl_dist * self.min_rr
+            else:
+                tp_zone = self._find_tp_zone(entry_price, "above")
+                if tp_zone is None:
+                    logger.info("[SNRv3] 找不到對面 SR 區，跳過")
+                    self.skip_counts["no_opposite_sr"] += 1
+                    return False
+                tp_price = tp_zone.bottom
 
         else:
             # 止損：假突破最高點 + buffer
@@ -970,13 +986,16 @@ class SNRStrategyV3(BaseStrategy):
                 self.skip_counts["sl_too_large"] += 1
                 return False
 
-            # 止盈：最近下方 SR 支撐區上緣
-            tp_zone = self._find_tp_zone(entry_price, "below")
-            if tp_zone is None:
-                logger.info("[SNRv3] 找不到對面 SR 區，跳過")
-                self.skip_counts["no_opposite_sr"] += 1
-                return False
-            tp_price = tp_zone.top
+            # FIX #2: 止盈方式 — 固定 RR 或找對面 SR
+            if self.use_fixed_rr:
+                tp_price = entry_price - sl_dist * self.min_rr
+            else:
+                tp_zone = self._find_tp_zone(entry_price, "below")
+                if tp_zone is None:
+                    logger.info("[SNRv3] 找不到對面 SR 區，跳過")
+                    self.skip_counts["no_opposite_sr"] += 1
+                    return False
+                tp_price = tp_zone.top
 
         # RR 檢查
         tp_dist = abs(tp_price - entry_price)
@@ -1033,85 +1052,69 @@ class SNRStrategyV3(BaseStrategy):
 
     async def _manage_trade(self, df: pd.DataFrame):
         """
-        每根 15M K 棒收盤後呼叫。
-        流程：
-          1. 確認持倉還在（防止 SL/TP 已被交易所執行但 Python 端未知）
-          2. 若 sl_order_id 尚未找到 → 從 searchOpen 查找 bracket 子單
-          3. 判斷是否觸發部分止盈（0.8R → 平半倉，同時把 SL 移到 BE）
-          4. 判斷是否啟動移動止盈（1.2R → trailing_active = True）
-          5. 移動止盈邏輯：計算新 SL 目標，若移動量足夠 → modify_order 更新 SL 子單
+        每根 5M K 棒收盤後呼叫。
+        對齊回測：純 bracket SL/TP 出場，不做部分止盈或移動止損。
+        唯一任務：偵測持倉是否消失（SL/TP 已成交），並同步狀態。
         """
         trade = self.active_trade
         if not trade or trade.is_closed:
             return
 
-        # ── Step 1：確認持倉還在 ──────────────────────────────────────────────
+        # ── 確認持倉還在 ──────────────────────────────────────────────────────
         # DataHub.positions 由 OrderMonitor 每 2 秒更新
-        from core.data_hub import DataHub
         pos = DataHub.positions.get(self.contract_id)
         if pos is None:
-            # 持倉消失 → SL 或 TP 已被交易所執行，清除本地狀態
-            logger.info("[SNRv3] 持倉消失（SL/TP 已成交），清除本地紀錄")
+            # 持倉消失 → SL 或 TP 已被交易所執行
+            # 用 sl_price / tp_price 估算損益（比用最後收盤價更接近實際）
+            last_close = float(df['c'].iloc[-1])
+            if trade.side == "long":
+                # 若收盤在 SL 以下 → 可能是 SL 成交
+                if last_close <= trade.sl_price:
+                    pnl_pts = trade.sl_price - trade.entry_price
+                elif last_close >= trade.tp_price:
+                    pnl_pts = trade.tp_price - trade.entry_price
+                else:
+                    pnl_pts = last_close - trade.entry_price
+            else:
+                if last_close >= trade.sl_price:
+                    pnl_pts = trade.entry_price - trade.sl_price
+                elif last_close <= trade.tp_price:
+                    pnl_pts = trade.entry_price - trade.tp_price
+                else:
+                    pnl_pts = trade.entry_price - last_close
+
+            pnl_usd = pnl_pts * 2.0  # MNQ $2/點
+            logger.info(
+                f"[SNRv3] 持倉消失（SL/TP 已成交）"
+                f"| {'多' if trade.side=='long' else '空'}"
+                f"| 進場={trade.entry_price:.2f}"
+                f"| SL={trade.sl_price:.2f} TP={trade.tp_price:.2f}"
+                f"| 估算損益: ${pnl_usd:+.0f}"
+            )
+
+            # 通知 risk_manager 記錄交易
+            rm = getattr(self.engine, 'risk_manager', None)
+            if rm:
+                rm.record_trade(pnl_usd)
+
             trade.is_closed = True
             self.active_trade = None
             self._sl_lookup_attempts = 0
             return
 
+        # 持倉仍在，只記錄浮動損益供 dashboard 用，不做任何主動干預
         current_price = float(df['c'].iloc[-1])
-        r = trade.risk_r  # 1R = 多少點
-
-        # ── Step 2：查找 SL bracket 子單 ID ──────────────────────────────────
-        # bracket 子單在主單成交後才會出現在 searchOpen，需等一段時間再查
-        if trade.sl_order_id is None and self._sl_lookup_attempts < self._sl_lookup_max:
-            await self._find_bracket_order_ids(trade)
-            self._sl_lookup_attempts += 1
-
-        # ── Step 3 & 4 & 5：依方向處理 ───────────────────────────────────────
-        if trade.side == "long":
-            profit_r = (current_price - trade.entry_price) / r if r > 0 else 0.0
-
-            # 部分止盈（0.8R）
-            if not trade.partial_closed and profit_r >= self.partial_tp_r:
-                await self._do_partial_close(trade, current_price)
-
-            # 移動止盈啟動（1.2R）
-            if not trade.trailing_active and profit_r >= self.trailing_r:
-                trade.trailing_active = True
-                trade.trailing_stop   = trade.entry_price   # 初始設在 BE（損益平衡）
-                logger.info(
-                    f"[SNRv3] 啟動移動止盈（{profit_r:.2f}R）"
-                    f"SL 移至 BE={trade.entry_price:.2f}"
-                )
-                await self._move_sl(trade, trade.entry_price)
-
-            # 持續更新移動止盈
-            if trade.trailing_active:
-                # 新 SL 目標 = 當前價格 - 0.5 ATR（保持一定緩衝）
-                new_trail = current_price - trade.atr * 0.5
-                if new_trail > trade.trailing_stop:
-                    trade.trailing_stop = new_trail
-                    await self._move_sl(trade, new_trail)
-
-        elif trade.side == "short":
-            profit_r = (trade.entry_price - current_price) / r if r > 0 else 0.0
-
-            if not trade.partial_closed and profit_r >= self.partial_tp_r:
-                await self._do_partial_close(trade, current_price)
-
-            if not trade.trailing_active and profit_r >= self.trailing_r:
-                trade.trailing_active = True
-                trade.trailing_stop   = trade.entry_price
-                logger.info(
-                    f"[SNRv3] 啟動移動止盈（{profit_r:.2f}R）"
-                    f"SL 移至 BE={trade.entry_price:.2f}"
-                )
-                await self._move_sl(trade, trade.entry_price)
-
-            if trade.trailing_active:
-                new_trail = current_price + trade.atr * 0.5
-                if new_trail < trade.trailing_stop:
-                    trade.trailing_stop = new_trail
-                    await self._move_sl(trade, new_trail)
+        r = trade.risk_r
+        if r > 0:
+            profit_r = (current_price - trade.entry_price) / r \
+                       if trade.side == "long" \
+                       else (trade.entry_price - current_price) / r
+            logger.debug(
+                f"[SNRv3] 持倉中 {'多' if trade.side=='long' else '空'}"
+                f"@ {trade.entry_price:.2f}"
+                f"| 現價={current_price:.2f}"
+                f"| {profit_r:+.2f}R"
+            )
 
     async def _find_bracket_order_ids(self, trade: ActiveTrade):
         """
@@ -1303,17 +1306,27 @@ class SNRStrategyV3(BaseStrategy):
             logger.error("[SNRv3] account_id 未設定，無法下單（請在 main.py 設定 strategy.account_id）")
             return
 
+        # FIX #3: 下單前先通過風控檢查
+        rm = getattr(self.engine, 'risk_manager', None)
+        if rm:
+            ok, reason = rm.check_safety()
+            if not ok:
+                logger.warning(f"[SNRv3] 風控阻止下單: {reason}")
+                return
+
         # 點數轉 ticks（取整數，最少 1 tick）
         sl_ticks_int = max(round(risk_r / self.TICK), 1)
         tp_ticks_int = max(round(abs(tp_price - entry_price) / self.TICK), 1)
 
         try:
+            # 從 engine.config 讀口數（預設 1）
+            _size = getattr(self.engine, 'config', {}).get('size', 1)
             order_id = await self.trading_service.place_order(
                 account_id  = self.account_id,
                 contract_id = self.contract_id,
                 order_type  = int(OrderType.MARKET),
                 side        = int(side),
-                size        = 1,
+                size        = _size,
                 sl_ticks    = sl_ticks_int,
                 tp_ticks    = tp_ticks_int,
             )
@@ -1380,4 +1393,5 @@ class SNRStrategyV3(BaseStrategy):
         return val
 
     def get_pos_size(self) -> int:
-        return 1  # 固定 1 口
+        # FIX #10: 與 _place_order 一致，從 engine.config 讀取實際口數
+        return getattr(self.engine, 'config', {}).get('size', 1)

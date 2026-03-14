@@ -115,7 +115,7 @@ class Dashboard:
         elif paused:
             session_line = "  ⏸  策略已手動暫停"
         elif session_open:
-            session_line = "  🟢 交易時段開放中  (倫敦/紐約盤)"
+            session_line = "  🟢 交易時段開放中  (紐約盤 NY)"
         else:
             session_line = "  🔴 休市時段  (等待倫敦/紐約盤)"
         lines.append(divider())

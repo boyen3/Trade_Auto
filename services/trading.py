@@ -197,6 +197,9 @@ class TradingService:
         """
         data = await self.client.request("POST", "/api/Position/searchOpen", json={"accountId": account_id})
         positions = []
+        # FIX #7: data 可能是 None（API 失敗），加 null guard
+        if not data or not data.get("success"):
+            return positions
         raw_list = data.get("positions", [])
         
         for p in raw_list:

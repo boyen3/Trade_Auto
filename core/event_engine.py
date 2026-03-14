@@ -47,11 +47,11 @@ class EventEngine:
                         self._initial_fired.add(symbol)
 
                         # 優先用 BarStore 完整歷史（SR 識別需要 500+ 根）
-                        # 若 bar_store 未注入則 fallback 用 DataHub 的 100 根
+                        # 策略用 5M K 棒，從 BarStore 讀完整 5M 歷史
                         full_df = df  # fallback
                         if self.bar_store is not None:
                             try:
-                                loaded = self.bar_store.load(symbol, "15m", limit=600)
+                                loaded = self.bar_store.load(symbol, "5m", limit=1800)
                                 if loaded is not None and len(loaded) > len(df):
                                     full_df = loaded
                             except Exception as e:
@@ -68,7 +68,7 @@ class EventEngine:
                     full_df = df
                     if self.bar_store is not None:
                         try:
-                            loaded = self.bar_store.load(symbol, "15m", limit=600)
+                            loaded = self.bar_store.load(symbol, "5m", limit=1800)
                             if loaded is not None and len(loaded) > len(df):
                                 full_df = loaded
                         except Exception:

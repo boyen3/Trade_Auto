@@ -44,11 +44,11 @@ class ProjectXEngine:
         self.notifier.set_command_handler(self.bot_handler)
 
         self.config = {
-            "account_id":      18699057,
+            "account_id":      int(os.getenv("ACCOUNT_ID", "18699057")),  # FIX #8: 從 .env 讀取
             "symbol":          "CON.F.US.MNQ.H26",
             "contract_expiry": "2026-03-21",   # 合約到期日，換月時更新
             "side":            0,
-            "size":            1,
+            "size":            int(os.getenv("TRADE_SIZE", "1")),
             "sl_points":       20,
             "tp_points":       40,
             "ticks_per_point": 4,
@@ -122,11 +122,30 @@ class ProjectXEngine:
         from strategies.snr_strategy_v3 import SNRStrategyV3
 
         strategy = SNRStrategyV3(
-            trading_service=self.trading_service,
-            market_service=self.market_service,
-            notifier=self.notifier,
-            engine=self,
-            contract_id=self.config["symbol"],
+            trading_service = self.trading_service,
+            market_service  = self.market_service,
+            notifier        = self.notifier,
+            engine          = self,
+            contract_id     = self.config["symbol"],
+            # ── 定案參數（v3c Walk-Forward 驗證通過）──────────────
+            fake_break_depth_mult = 0.60,
+            htf_primary_ema       = 50,
+            htf_secondary_ema     = 9,
+            min_rr                = 3.0,
+            sl_max_atr_mult       = 2.0,
+            sl_buffer_mult        = 0.15,
+            sr_sensitivity        = 1.5,
+            sr_near_mult          = 2.5,
+            vol_mult              = 0.0,   # 停用量能過濾
+            use_fixed_rr          = True,  # 固定 RR 止盈（不找對面 SR）
+            # ── 時段：NY only 13:30~20:00 UTC ─────────────────────
+            session_london_start  = 99,    # 99 = 停用倫敦時段
+            session_london_end    = 99,
+            session_ny_start      = 13,
+            session_ny_start_min  = 30,
+            session_ny_end        = 20,
+            # ── 口數 ──────────────────────────────────────────────
+            # size 從 engine.config["size"] 讀取（在 _place_order 內自動取得）
         )
         strategy.account_id = self.config["account_id"]
         self._strategy = strategy  # 供 /diag 指令讀取
@@ -211,7 +230,7 @@ class ProjectXEngine:
             )
 
     async def _check_contract_expiry(self):
-        """合約到期前 3 天發 Telegram 提醒（每天只發一次）"""
+        """合約到期前 3 天發 Telegram 提醒（每天只發一次，重啟後不重發）"""
         expiry_str = self.config.get("contract_expiry", "")
         if not expiry_str:
             return
@@ -220,9 +239,12 @@ class ProjectXEngine:
             days_left = (expiry - datetime.utcnow()).days
             if 0 <= days_left <= 3:
                 now_date = datetime.utcnow().strftime("%Y-%m-%d")
-                cache_key = f"_expiry_notified_{now_date}"
-                if not getattr(self, cache_key, False):
-                    setattr(self, cache_key, True)
+                # FIX #9: 改用 StateStore 持久化，重啟後不會重複發通知
+                from core.state_store import StateStore
+                store = StateStore()
+                state = store.get_strategy_state("expiry_notified")
+                if state.get("date") != now_date:
+                    store.update_strategy_state("expiry_notified", {"date": now_date})
                     await self.notifier.send_message(
                         f"⚠️ *合約即將到期*\n"
                         f"`{self.config['symbol']}` 還有 *{days_left} 天* 到期\n"
